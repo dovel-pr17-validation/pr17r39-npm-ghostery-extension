@@ -1,0 +1,267 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { browser, expect, $ } from '@wdio/globals';
+import {
+  setupExtension,
+  getExtensionElement,
+  setPrivacyToggle,
+  setAdditionalFiltersToggle,
+  waitForIdleBackgroundTasks,
+  expectAdsBlocked,
+  getFrame,
+  openExternalURL,
+  ADBLOCKING_GLOBAL_SELECTOR,
+  ADBLOCKING_URL_SELECTOR,
+  TRACKER_IDS,
+  PAGE_URL,
+} from '../utils.js';
+
+describe('Main Features', function () {
+  before(setupExtension);
+
+  describe('Never-consent', function () {
+    const WEBSITE_URL = 'https://www.onetrust.com/';
+    const SELECTOR = '#onetrust-consent-sdk';
+
+    it('displays consent popup', async function () {
+      await setPrivacyToggle('never-consent', false);
+      await openExternalURL(WEBSITE_URL);
+
+      // In some regions the cmp element might not be loaded at all
+      // so we only check if the CMP is visible if the element exists
+      const cmp = await $(SELECTOR);
+      if (await cmp.isExisting()) await expect(cmp).toBeDisplayed();
+
+      await setPrivacyToggle('never-consent', true);
+    });
+
+    it('closes the consent popup', async function () {
+      await openExternalURL(WEBSITE_URL);
+      // Let the never-consent take effect
+      await browser.pause(2000);
+
+      // Never-consent can left the cmp structure until next page load
+      await openExternalURL(WEBSITE_URL);
+
+      // In some regions the cmp element might not be loaded at all
+      // so we only check if the CMP is visible if the element exists
+      const cmp = await $(SELECTOR);
+      if (await cmp.isExisting()) await expect(cmp).toHaveText('');
+    });
+
+    it('sets the Sec-GPC request header', async function () {
+      await browser.url(PAGE_URL);
+
+      const headers = await browser.execute(async () => {
+        const response = await fetch('/headers', { cache: 'no-store' });
+        return response.json();
+      });
+
+      expect(headers['sec-gpc']).toBe('1');
+
+      await setPrivacyToggle('never-consent', false);
+
+      await browser.url(PAGE_URL);
+
+      const headersAfter = await browser.execute(async () => {
+        const response = await fetch('/headers', { cache: 'no-store' });
+        return response.json();
+      });
+
+      expect(headersAfter['sec-gpc']).toBeUndefined();
+
+      await setPrivacyToggle('never-consent', true);
+    });
+
+    it('sets navigator.globalPrivacyControl in the page main world', async function () {
+      await browser.url(PAGE_URL);
+
+      // Main frame
+      expect(await browser.execute(() => navigator.globalPrivacyControl)).toBe(true);
+
+      // Sub-frame — each frame has its own navigator, so injection must reach it
+      const frame = await getFrame('#iframe-static');
+      expect(await frame.execute(() => navigator.globalPrivacyControl)).toBe(true);
+
+      // Disabling never-consent must unregister the content script,
+      // so pages loaded afterwards no longer see the patched value
+      await setPrivacyToggle('never-consent', false);
+
+      await browser.url(PAGE_URL);
+
+      expect(await browser.execute(() => !!navigator.globalPrivacyControl)).toBe(false);
+
+      await setPrivacyToggle('never-consent', true);
+    });
+  });
+
+  describe('Ad-Blocking', function () {
+    const DYNAMIC_SELECTOR = '#ghostery-test-page-element-1';
+
+    it('does not block ads on a page', async function () {
+      await setPrivacyToggle('ad-blocking', false);
+      await browser.url(PAGE_URL);
+
+      await expect($(ADBLOCKING_GLOBAL_SELECTOR)).toBeDisplayed();
+      await expect($(ADBLOCKING_URL_SELECTOR)).toBeDisplayed();
+
+      for (const id of ['iframe-static', 'iframe-dynamic', 'iframe-local']) {
+        const frame = await getFrame(`#${id}`);
+        await expect(frame.$(ADBLOCKING_GLOBAL_SELECTOR)).toBeDisplayed();
+        await expect(frame.$(ADBLOCKING_URL_SELECTOR)).toBeDisplayed();
+      }
+    });
+
+    describe('block ads on different frames', function () {
+      before(async function () {
+        await setPrivacyToggle('ad-blocking', true);
+        await browser.url(PAGE_URL);
+      });
+
+      it('main frame of the page', expectAdsBlocked);
+
+      it('subframe of the page', async function () {
+        await expectAdsBlocked(await getFrame('#iframe-static'));
+      });
+
+      it('dynamic subframe of the page', async function () {
+        await expectAdsBlocked(await getFrame('#iframe-dynamic'));
+      });
+
+      it('local subframe of the page', async function () {
+        await expectAdsBlocked(await getFrame('#iframe-local'));
+      });
+    });
+
+    it('blocks dynamic ads on a page', async function () {
+      await setPrivacyToggle('ad-blocking', true);
+      await browser.url(PAGE_URL);
+
+      await browser.execute(function (selector) {
+        const adSlot = document.createElement('div');
+
+        adSlot.id = selector.slice(1);
+        adSlot.style.width = '300px';
+        adSlot.style.height = '250px';
+        adSlot.style.backgroundColor = 'yellow';
+
+        document.body.appendChild(adSlot);
+      }, DYNAMIC_SELECTOR);
+
+      // The dynamic element might be blocked after a delay
+      await browser.pause(100);
+
+      await expect($(DYNAMIC_SELECTOR)).toExist();
+      await expect($(DYNAMIC_SELECTOR)).not.toBeDisplayed();
+    });
+  });
+
+  describe('Anti-Tracking', function () {
+    it('does not block tracker requests on the page', async function () {
+      await setPrivacyToggle('anti-tracking', false);
+      await browser.url(PAGE_URL);
+
+      await browser.url('ghostery:panel');
+      await getExtensionElement('button:detailed-view').click();
+
+      for (const trackerId of TRACKER_IDS) {
+        await expect(getExtensionElement(`icon:tracker:${trackerId}:blocked`)).not.toBeDisplayed();
+        await expect(getExtensionElement(`icon:tracker:${trackerId}:modified`)).not.toBeDisplayed();
+      }
+    });
+
+    it('blocks tracker requests on the page', async function () {
+      await setPrivacyToggle('anti-tracking', true);
+      await browser.url(PAGE_URL);
+
+      await browser.url('ghostery:panel');
+      await getExtensionElement('button:detailed-view').click();
+
+      for (const trackerId of TRACKER_IDS) {
+        await expect(getExtensionElement(`icon:tracker:${trackerId}:blocked`)).toBeDisplayed();
+      }
+    });
+  });
+
+  describe('Regional Filters', function () {
+    // A generic cosmetic filter, which is only in the Polish filter list
+    const SELECTOR = '.reklama-gora';
+
+    it('shows the ads on the page', async function () {
+      await setAdditionalFiltersToggle('regional-filters', false);
+
+      await browser.url(PAGE_URL);
+      await expect($(SELECTOR)).toBeDisplayed();
+
+      await setAdditionalFiltersToggle('regional-filters', true);
+    });
+
+    it('hides the ads on the page', async function () {
+      await setAdditionalFiltersToggle('regional-filters', true);
+      const checkbox = await getExtensionElement('checkbox:regional-filters:pl');
+
+      if (!(await checkbox.getProperty('checked'))) {
+        await checkbox.click();
+        await expect(checkbox).toHaveElementProperty('checked', true);
+      }
+
+      // Allow engines to reload
+      await waitForIdleBackgroundTasks();
+
+      await browser.url(PAGE_URL);
+      await expect($(SELECTOR)).toExist();
+      await expect($(SELECTOR)).not.toBeDisplayed();
+    });
+  });
+
+  describe('Global Pause', function () {
+    it("doesn't block ads when is enabled", async function () {
+      await setPrivacyToggle('global-pause', true);
+
+      // Reload twice the page to ensure it is not loaded from cache
+      await browser.url(PAGE_URL);
+      await browser.url(PAGE_URL);
+
+      await expect($(ADBLOCKING_GLOBAL_SELECTOR)).toBeDisplayed();
+
+      await setPrivacyToggle('global-pause', false);
+    });
+  });
+
+  describe('Website Pause', function () {
+    it("pauses the website's privacy settings", async function () {
+      // Ensure ad-blocking is enabled
+      await browser.url(PAGE_URL);
+      await expect($(ADBLOCKING_GLOBAL_SELECTOR)).not.toBeDisplayed();
+
+      // Pause the website
+      await browser.url('ghostery:panel');
+      await getExtensionElement('button:pause').click();
+      await waitForIdleBackgroundTasks();
+
+      // Reload twice the page to ensure it is not loaded from cache
+      await browser.url(PAGE_URL);
+      await browser.url(PAGE_URL);
+
+      await expect($(ADBLOCKING_GLOBAL_SELECTOR)).toBeDisplayed();
+
+      // Resume the website
+      await browser.url('ghostery:panel');
+      await getExtensionElement('button:resume').click();
+      await waitForIdleBackgroundTasks();
+
+      // Reload and check ads are blocked again
+      await browser.url(PAGE_URL);
+      await expect($(ADBLOCKING_GLOBAL_SELECTOR)).not.toBeDisplayed();
+    });
+  });
+});

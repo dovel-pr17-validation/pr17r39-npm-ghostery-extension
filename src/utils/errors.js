@@ -1,0 +1,130 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import * as Sentry from '@sentry/browser';
+import { store } from 'hybrids';
+
+import Errors from '/store/errors.js';
+import Options from '/store/options.js';
+
+import getBrowserInfo from './browser-info.js';
+
+const SAMPLE_RATE = 0.3; // Sampling rate for non-critical errors in production
+const TAG_CRITICAL = 'critical'; // Tag to identify critical errors that should always be sent
+
+const { version } = chrome.runtime.getManifest();
+const hostRegexp = new RegExp(new URL(chrome.runtime.getURL('/')).host, 'g');
+
+// Detects whether a stack string contains actual call frames.
+// V8 uses "\n    at ...", Firefox/Safari use "fn@url" / "@url".
+function hasStackFrames(stack) {
+  return typeof stack === 'string' && /(\n\s*at\s|@)/.test(stack);
+}
+
+const config = {
+  tunnel: 'https://crashreporting.ghostery.net/',
+  dsn: 'https://05c74f55666649f0b6d671b9c37f6da1@o475874.ingest.sentry.io/6447378',
+  release: `ghostery-extension@${version}`,
+  debug: __DEBUG__,
+  environment: __DEBUG__ ? 'development' : 'production',
+  // We use Sentry to track critical errors only.
+  // That means we want to prevent default configuration from
+  // sending additional messages like session logs, activity pings, etc
+  autoSessionTracking: false,
+  defaultIntegrations: false,
+  // Sampling is handled in beforeSend to allow per-event control
+  sampleRate: 1.0,
+  beforeSend(event) {
+    if (!event.tags?.ua) return null;
+
+    if (event.tags?.[TAG_CRITICAL]) {
+      return event;
+    }
+
+    if (!__DEBUG__ && Math.random() > SAMPLE_RATE) {
+      return null;
+    }
+
+    return event;
+  },
+  attachStacktrace: true,
+};
+
+Sentry.init(config);
+
+// Sentry rejects tags with empty or NaN values ("expected a non-empty value"),
+// which discards the whole tag, so only set tags that carry a usable value.
+function setTag(key, value) {
+  if (value === '' || value == null || (typeof value === 'number' && Number.isNaN(value))) {
+    return;
+  }
+  Sentry.setTag(key, value);
+}
+
+const browserInfo = getBrowserInfo();
+
+setTag('ua', browserInfo.token);
+setTag('uaVersion', browserInfo.version);
+setTag('os', browserInfo.os);
+setTag('osVersion', browserInfo.osVersion);
+
+// Do not rename this to `captureException`/`captureMessage`. Sentry's stack
+// parser (STRIP_FRAME_REGEXP = /captureMessage|captureException/) drops the
+// innermost stack frame whose function name matches, assuming it belongs to the
+// SDK. Our fallback stack below is captured inside this function, so such a name
+// would strip the only frame frameless errors have, leaving no stack trace.
+export async function captureError(error, { critical = false, once = false } = {}) {
+  // Capture a fallback stack synchronously, before the first `await`,
+  // so it still includes the caller frame when `error.stack` has no frames
+  // (e.g. errors from chrome.* API rejections or serialized across contexts).
+  const fallbackStack = new Error().stack;
+
+  const { terms, feedback } = await store.resolve(Options);
+
+  if (!terms || !feedback || !(error instanceof Error)) {
+    return;
+  }
+
+  if (once) {
+    const id = error.message;
+
+    if (typeof id !== 'string' || !id) {
+      console.warn('[errors] error has no message to identify it');
+      return;
+    }
+
+    const errors = await store.resolve(Errors);
+
+    // Already sent this error within the last 24 hours, skip it
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    if (Date.now() - errors.onceIds[id] < DAY_MS) {
+      return;
+    }
+
+    await store.set(errors, { onceIds: { [id]: Date.now() } });
+  }
+
+  const newError = new Error(error.message);
+
+  newError.name = error.name;
+  newError.cause = error.cause;
+
+  const stack = hasStackFrames(error.stack) ? error.stack : (fallbackStack ?? '');
+  newError.stack = stack.replace(hostRegexp, 'filtered');
+
+  Sentry.withScope((scope) => {
+    if (critical) scope.setTag(TAG_CRITICAL, true);
+    Sentry.captureException(newError);
+  });
+}
+
+// Debug tools
+(globalThis.ghostery ??= {}).errors = { captureError };

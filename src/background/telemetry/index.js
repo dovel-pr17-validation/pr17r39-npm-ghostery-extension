@@ -1,0 +1,124 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { store } from 'hybrids';
+
+import Options from '/store/options.js';
+import Config from '/store/config.js';
+import DailyStats from '/store/daily-stats.js';
+import asyncSetup from '/utils/setup.js';
+import * as OptionsObserver from '/utils/options-observer.js';
+import { getStorage, saveStorage } from '/utils/telemetry.js';
+
+import Metrics from './metrics.js';
+import detectAttribution from './attribution.js';
+
+let runner;
+const setup = asyncSetup('telemetry', [
+  (async () => {
+    const { version } = chrome.runtime.getManifest();
+    const metrics = await getStorage();
+
+    if (!metrics.installDate) {
+      metrics.installDate = new Date().toISOString().split('T')[0];
+      await saveStorage(metrics);
+    }
+
+    runner = new Metrics({
+      METRICS_BASE_URL: __DEBUG__ ? 'https://staging-d.ghostery.com' : 'https://d.ghostery.com',
+      EXTENSION_VERSION: version,
+      storage: metrics,
+      saveStorage,
+      getConf: async () => {
+        const yesterdayId = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+        const [options, config, dailyStats] = await Promise.all([
+          store.resolve(Options),
+          store.resolve(Config),
+          store.resolve(DailyStats, yesterdayId).catch(() => undefined),
+        ]);
+
+        return {
+          options,
+          config,
+          // Use the previous full UTC day so the bucket doesn't depend on
+          // the time-of-day at which the ping fires.
+          yesterdayPages: dailyStats?.pages,
+          userSettings: __CHROMIUM__ ? await chrome.action?.getUserSettings?.() : undefined,
+          isAllowedIncognitoAccess: await chrome.extension.isAllowedIncognitoAccess(),
+        };
+      },
+      log: console.debug.bind(console, '[telemetry]'),
+    });
+  })(),
+]);
+
+let enabled = false;
+OptionsObserver.addListener(async function telemetry({ terms, feedback }, lastOptions) {
+  // Update enabled state on every change
+  enabled = terms && feedback;
+
+  // Skip the rest of the logic for sequential runs after the first one
+  // as the `terms` option can only by enabled once
+  if (lastOptions && lastOptions.terms) return;
+
+  // Wait for setup to finish initializing the runner
+  setup.pending && (await setup.pending);
+
+  // In debug builds, skip the automatic capture and let `e2e:captureAttribution`
+  // trigger it once the test has finished its setup.
+  if (!__DEBUG__ && runner.isJustInstalled()) {
+    await runner.setUTMs(await detectAttribution());
+  }
+
+  // We always go through uninstall url to measure bots
+  runner.setUninstallUrl();
+
+  if (terms) {
+    if (runner.isJustInstalled()) runner.ping('install');
+
+    if (feedback) runner.ping('active');
+  }
+});
+
+export async function captureAttribution() {
+  setup.pending && (await setup.pending);
+  await runner.setUTMs(await detectAttribution());
+}
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+  setup.pending && (await setup.pending);
+  await runner.setInstallReason(details.reason);
+});
+
+export async function recordSerpVisit() {
+  setup.pending && (await setup.pending);
+  await runner.recordSerpVisit();
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (enabled && msg.action?.startsWith('telemetry:')) {
+    (async () => {
+      setup.pending && (await setup.pending);
+
+      switch (msg.action) {
+        case 'telemetry:ping':
+          await runner.ping(msg.event);
+          break;
+        case 'telemetry:modeTouched': {
+          runner.storage.modeTouched = true;
+          await saveStorage(runner.storage);
+          console.debug('[telemetry] "modeTouched" flag set');
+          break;
+        }
+      }
+    })();
+  }
+});

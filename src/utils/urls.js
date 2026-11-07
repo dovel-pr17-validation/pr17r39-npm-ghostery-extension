@@ -1,0 +1,42 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { isSafari } from './browser-info.js';
+
+export const GHOSTERY_DOMAIN = __DEBUG__ ? 'ghosterystage.com' : 'ghostery.com';
+
+export const TERMS_AND_CONDITIONS_URL = `https://www.${GHOSTERY_DOMAIN}/privacy/ghostery-terms-and-conditions?utm_source=gbe&utm_campaign=onboarding`;
+export const HOME_PAGE_URL = `https://www.${GHOSTERY_DOMAIN}/`;
+
+export const WTM_PAGE_URL = `https://www.${GHOSTERY_DOMAIN}/whotracksme`;
+export const SUPPORT_PAGE_URL = `https://www.${GHOSTERY_DOMAIN}/support`;
+
+export const PANEL_STORE_PAGE_URL = `${HOME_PAGE_URL}downloads/review?utm_source=gbe&utm_campaign=panel`;
+export const REVIEW_STORE_PAGE_URL = `${HOME_PAGE_URL}downloads/review?utm_source=gbe&utm_campaign=review`;
+
+export const BECOME_A_CONTRIBUTOR_PAGE_URL =
+  __CHROMIUM__ && isSafari()
+    ? 'ghosteryapp://www.ghostery.com'
+    : 'https://www.ghostery.com/become-a-contributor';
+
+export const ENGINE_CONFIGS_ROOT_URL = `https://${__STAGING__ ? 'staging-' : ''}cdn.ghostery.com/adblocker/configs`;
+
+export const CDN_URL = __STAGING__
+  ? 'https://staging-cdn.ghostery.com/'
+  : 'https://cdn.ghostery.com/';
+
+export const PAUSE_ASSISTANT_LEARN_MORE_URL = `https://www.${GHOSTERY_DOMAIN}/blog/browsing-assistant-user-agent`;
+export const TRACKERS_PREVIEW_LEARN_MORE_URL = `https://www.${GHOSTERY_DOMAIN}/blog/introducing-wtm-serp-report`;
+export const DISTRACTIONS_LEARN_MORE_URL = `https://www.${GHOSTERY_DOMAIN}/blog/distractions-remove-UI-clutter`;
+
+export const ZAP_AUTORELOAD_DISABLED_HOSTNAMES = ['youtube.com'];
+
+export const SURVEY_POST_ONBOARDING_URL = `https://blocksurvey.io/install-survey-postonboarding-R6q0d5dGR9OY6202iNPmGQ?v=o`;

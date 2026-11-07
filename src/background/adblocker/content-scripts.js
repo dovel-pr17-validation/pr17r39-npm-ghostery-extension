@@ -1,0 +1,148 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+const firefoxRegistry = (() => {
+  const map = new Map();
+  return {
+    async register(hostname, scriptletsByWorld) {
+      this.unregister(hostname);
+
+      // Reserve synchronously so a concurrent onCommitted register() short-circuits on
+      // isRegistered() instead of registering the hostname again and injecting twice.
+      const registered = [];
+      map.set(hostname, registered);
+
+      try {
+        for (const [world, code] of Object.entries(scriptletsByWorld)) {
+          if (!code) continue;
+
+          registered.push(
+            await browser.contentScripts.register({
+              js: [{ code }],
+              allFrames: true,
+              // Subdomain frames register their own scriptlets, so match only this exact hostname.
+              matches: [`https://${hostname}/*`, `http://${hostname}/*`],
+              matchAboutBlank: true,
+              matchOriginAsFallback: true,
+              runAt: 'document_start',
+              world,
+            }),
+          );
+        }
+      } catch (e) {
+        console.warn(e);
+        this.unregister(hostname);
+      }
+    },
+    isRegistered(hostname) {
+      return map.has(hostname);
+    },
+    unregister(hostname) {
+      for (const contentScript of map.get(hostname) ?? []) {
+        contentScript.unregister();
+      }
+      map.delete(hostname);
+    },
+    unregisterAll() {
+      for (const hostname of map.keys()) {
+        this.unregister(hostname);
+      }
+    },
+  };
+})();
+
+// Registrations persist across service-worker restarts, so register() upserts by a stable id
+// and unregisterAll() queries the browser to purge them (the map is empty after a restart).
+const USER_SCRIPTS_NAMESPACE = 'ghostery-scriptlet';
+
+function userScriptId(hostname, world) {
+  return `${USER_SCRIPTS_NAMESPACE}:${world}:${hostname}`;
+}
+
+// __CHROMIUM__ guard so chrome.userScripts is tree-shaken from the Firefox build.
+const chromiumRegistry =
+  __CHROMIUM__ &&
+  (() => {
+    const registered = new Set();
+    return {
+      async register(hostname, scriptletsByWorld) {
+        // Reserve synchronously so a concurrent register() short-circuits on isRegistered().
+        registered.add(hostname);
+
+        const jobs = [];
+        for (const [world, code] of Object.entries(scriptletsByWorld)) {
+          const id = userScriptId(hostname, world);
+
+          // A world with no code may still hold a registration from the previous engine.
+          if (!code) {
+            jobs.push(chrome.userScripts.unregister({ ids: [id] }).catch(() => {}));
+            continue;
+          }
+
+          const script = {
+            id,
+            js: [{ code }],
+            allFrames: true,
+            matches: [`https://${hostname}/*`, `http://${hostname}/*`],
+            runAt: 'document_start',
+            world: world === 'ISOLATED' ? 'USER_SCRIPT' : world,
+          };
+
+          jobs.push(
+            chrome.userScripts
+              .register([script])
+              .catch(() => chrome.userScripts.update([script]))
+              // On failure, release the reservation so the next navigation retries.
+              .catch((e) => {
+                console.warn(e);
+                this.unregister(hostname);
+              }),
+          );
+        }
+
+        await Promise.all(jobs);
+      },
+      isRegistered(hostname) {
+        return registered.has(hostname);
+      },
+      unregister(hostname) {
+        registered.delete(hostname);
+        // Batch unregister rejects unless every id exists, so each world gets its own call.
+        for (const world of ['MAIN', 'ISOLATED']) {
+          chrome.userScripts.unregister({ ids: [userScriptId(hostname, world)] }).catch(() => {});
+        }
+      },
+      unregisterAll() {
+        registered.clear();
+        chrome.userScripts.getScripts().then((scripts) => {
+          // A hostname re-registered while getScripts was in flight already carries fresh
+          // code; purging it would leave isRegistered() true with no registration behind it.
+          const keep = new Set(
+            [...registered].flatMap((hostname) => [
+              userScriptId(hostname, 'MAIN'),
+              userScriptId(hostname, 'ISOLATED'),
+            ]),
+          );
+          const ids = scripts
+            .filter((s) => s.id.startsWith(USER_SCRIPTS_NAMESPACE) && !keep.has(s.id))
+            .map((s) => s.id);
+          // An id removed since the snapshot would reject a batch call and keep the rest alive.
+          for (const id of ids) {
+            chrome.userScripts.unregister({ ids: [id] }).catch(() => {});
+          }
+        }, console.warn);
+      },
+    };
+  })();
+
+// browser.contentScripts (Firefox) and chrome.userScripts (Chromium) fill the same role;
+// the rest of the adblocker treats whichever one this resolves to as "content scripts".
+export const contentScripts = __FIREFOX__ ? firefoxRegistry : chromiumRegistry;

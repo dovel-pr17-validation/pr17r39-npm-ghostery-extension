@@ -1,0 +1,48 @@
+# Numerous always-ignore extensions
+*.diff
+*.err
+*.orig
+*.log
+*.rej
+*.swo
+*.swp
+*.vi
+*~
+
+# OS or Editor folders
+.DS_Store
+.cache
+.eslintcache
+.project
+.settings
+.tmproj
+nbproject
+Thumbs.db
+.tern-project
+.vscode
+
+# NPMs
+node_modules/
+npm-debug.log
+
+# Source
+src/rule_resources
+src/static_pages
+
+# Downloaded binaries
+scripts/bin/
+
+# Build
+dist/
+web-ext-artifacts/
+
+# Secrets
+.env
+
+# xcode
+*.xcuserstate
+xcuserdata
+*.xcloc
+
+# WDIO
+.wdio

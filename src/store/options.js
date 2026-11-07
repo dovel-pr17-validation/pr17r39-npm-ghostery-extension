@@ -1,0 +1,360 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { store } from 'hybrids';
+
+import { DEFAULT_REGIONS } from '/utils/regions.js';
+import { isOpera, isWebkit } from '/utils/browser-info.js';
+import { findParentDomain } from '/utils/domains.js';
+import { safeForStorage } from '/utils/storage.js';
+
+import CustomFilters from './custom-filters.js';
+import ManagedConfig from './managed-config.js';
+import Notification from './notification.js';
+
+const UPDATE_OPTIONS_ACTION_NAME = 'updateOptions';
+export const GLOBAL_PAUSE_ID = '<all_urls>';
+
+export const MODE_DEFAULT = 'default';
+export const MODE_ZAP = 'zap';
+
+export const ENGINES = [
+  { name: 'ads', key: 'blockAds' },
+  { name: 'tracking', key: 'blockTrackers' },
+  { name: 'annoyances', key: 'blockAnnoyances' },
+];
+
+const OPTIONS_VERSION = 6;
+
+const Options = {
+  // Mode
+  mode: MODE_DEFAULT, // 'default' | 'zap'
+
+  // Main features
+  blockAds: true,
+  blockTrackers: true,
+  blockAnnoyances: true,
+
+  // Regional filters
+  regionalFilters: {
+    enabled: DEFAULT_REGIONS.length > 0,
+    regions: DEFAULT_REGIONS.length ? DEFAULT_REGIONS : [String],
+  },
+
+  // Advanced features
+  customFilters: {
+    enabled: false,
+    trustedScriptlets: false,
+    filterLists: store.record({ enabled: true, trustedScriptlets: false }),
+  },
+
+  // Distractions
+  distractions: store.record(false),
+
+  // Experimental features
+  autoconsent: { autoAction: 'optOut', gpc: true },
+  fixesFilters: true,
+
+  // SERP protection
+  serpTrackingPrevention: true,
+
+  // Redirect protection
+  redirectProtection: {
+    enabled: true,
+    exceptions: store.record(true),
+  },
+
+  // WhoTracks.Me
+  wtmSerpReport: true,
+  trackerWheel: false,
+  ...(__FIREFOX__ || !isWebkit() ? { trackerCount: true } : {}),
+  pauseAssistant: true,
+
+  // Onboarding
+  terms: __CHROMIUM__ ? true : false,
+  feedback: true,
+  onboarding: false,
+
+  // UI
+  panel: { statsType: 'graph', notifications: true },
+  contextMenu: true,
+  theme: '',
+
+  // Tracker exceptions
+  exceptions: store.record({ global: false, domains: [String] }),
+
+  // Paused domains (ghostery filtering mode)
+  paused: store.record({ revokeAt: 0, assist: false, managed: false }),
+
+  // Zapped domains (zap filtering mode)
+  zapped: store.record(true),
+
+  // Sync & Update
+  sync: true,
+  revision: 0,
+
+  // Filters update timestamp
+  filtersUpdatedAt: 0,
+
+  // What's new: the announced minor version, whether the recap popup was auto-opened,
+  // and whether the recap page was already shown.
+  // It starts as shown, so fresh installations have nothing to catch up on
+  whatsNew: { version: '', popup: false, shown: true },
+
+  [store.connect]: {
+    async get() {
+      let { options = {}, optionsVersion } = await chrome.storage.local.get([
+        'options',
+        'optionsVersion',
+      ]);
+
+      // Set version to the latest one if it is not set
+      // or trigger migration for older versions
+      if (!optionsVersion) {
+        chrome.storage.local.set({ optionsVersion: OPTIONS_VERSION });
+      } else if (optionsVersion < OPTIONS_VERSION) {
+        await migrate(options, optionsVersion);
+      }
+
+      // Apply managed options for supported platforms
+      if (__FIREFOX__ || (!isWebkit() && !isOpera())) {
+        return manage(options);
+      }
+
+      return options;
+    },
+    async set(_, options) {
+      options = options || {};
+
+      await chrome.storage.local.set({ options: safeForStorage(options) });
+
+      // Send update message to another contexts (background page / panel / options)
+      await chrome.runtime
+        .sendMessage({
+          action: UPDATE_OPTIONS_ACTION_NAME,
+        })
+        .catch(() => {
+          // sendMessage may fail without potential target
+        });
+
+      return options;
+    },
+  },
+};
+
+// Options that are stored only in the local storage and not synced across devices
+const LOCAL_OPTIONS = [
+  'terms',
+  'feedback',
+  'onboarding',
+  'panel',
+  'sync',
+  'revision',
+  'filtersUpdatedAt',
+  'fixesFilters',
+  'whatsNew',
+];
+
+export const SYNC_OPTIONS = Object.keys(Options).filter((key) => !LOCAL_OPTIONS.includes(key));
+
+// Protected options may contain sensitive information, so in the
+// broken page reports they are reduced to a simple boolean.
+const PROTECTED_OPTIONS = {
+  customFilters: (value) => value.enabled,
+  exceptions: (value) => Object.keys(value).length > 0,
+  paused: (value) => Object.values(value).some(({ assist }) => !assist),
+  zapped: (value) => Object.keys(value).length > 0,
+};
+
+// Returns options prepared for the broken page report. Protected options, which
+// may contain sensitive information, are reduced to a simple boolean.
+export function getReportOptions(options) {
+  const result = {};
+
+  for (const key of [...SYNC_OPTIONS, 'filtersUpdatedAt']) {
+    const protect = PROTECTED_OPTIONS[key];
+
+    if (protect) {
+      // Only report protected options when they are active
+      if (protect(options[key])) result[key] = true;
+    } else {
+      result[key] = options[key];
+    }
+  }
+
+  return result;
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.action === UPDATE_OPTIONS_ACTION_NAME) {
+    store.clear(Options, false);
+    store.get(Options);
+  }
+});
+
+export default Options;
+
+async function migrate(options, optionsVersion) {
+  // Pushed in v10.3.14
+  if (optionsVersion < 2) {
+    // Migrate 'paused' array to record
+    if (options.paused) {
+      options.paused = options.paused.reduce((acc, { id, revokeAt }) => {
+        acc[id] = { revokeAt };
+        return acc;
+      }, {});
+    }
+
+    console.debug('[options] Migrated to version 2:', options);
+  }
+
+  // Pushed in v10.4.3
+  if (optionsVersion < 3) {
+    // Check if the user has custom filters, so we need to
+    // reflect the enabled state in the options
+    const { text } = await store.resolve(CustomFilters);
+    if (text) {
+      options.customFilters = {
+        ...options.customFilters,
+        enabled: true,
+      };
+    }
+
+    console.debug('[options] Migrated to version 3:', options);
+  }
+
+  // Notifications structure changes
+  if (optionsVersion < 4) {
+    if (options.onboarding) {
+      if (options.onboarding.pinIt) {
+        await store.set(Notification, { id: 'pin-it', shown: 1 });
+      }
+
+      if (options.onboarding.serpShown) {
+        await store.set(Notification, {
+          id: 'opera-serp',
+          shown: options.onboarding.serpShown,
+          lastShownAt: options.onboarding.serpShownAt,
+        });
+      }
+
+      options.onboarding = !!options.onboarding.shown;
+    }
+  }
+
+  // Change redirect protection default to enabled
+  if (optionsVersion < 5) {
+    if (options.redirectProtection) {
+      options.redirectProtection.enabled = true;
+    }
+  }
+
+  // What's new version moved into an object with the recap page state
+  if (optionsVersion < 6) {
+    options.whatsNew = { version: options.whatsNewVersion || '', shown: true };
+    delete options.whatsNewVersion;
+  }
+
+  // Flush updated options and version to the storage
+  await chrome.storage.local.set({
+    options,
+    optionsVersion: OPTIONS_VERSION,
+  });
+
+  console.log(`[options] Migrated to version ${OPTIONS_VERSION} from version ${optionsVersion}...`);
+}
+
+async function manage(options) {
+  const managed = await store.resolve(ManagedConfig);
+
+  if (managed.disableOnboarding === true) {
+    options.terms = true;
+    options.onboarding = true;
+  }
+
+  if (managed.disableUserControl === true) {
+    options.sync = false;
+    options.contextMenu = false;
+
+    // Clear out the paused state, to overwrite with the current managed state
+    options.paused = {};
+  } else {
+    // The user has control, so we need to remove only managed paused domains
+    // as they are overwritten by `trustedDomains` option below
+    if (options.paused) {
+      for (const domain of Object.keys(options.paused)) {
+        if (options.paused[domain].managed === true) {
+          delete options.paused[domain];
+        }
+      }
+    }
+  }
+
+  if (managed.disableUserAccount === true) {
+    options.sync = false;
+  }
+
+  if (managed.disableTrackersPreview === true) {
+    options.wtmSerpReport = false;
+  }
+
+  // Apply trusted domains if they are configured
+  if (managed.trustedDomains.enabled) {
+    options.paused ||= {};
+    managed.trustedDomains.domains.forEach((domain) => {
+      options.paused[domain] = { revokeAt: 0, managed: true };
+    });
+  }
+
+  if (managed.customFilters.enabled) {
+    options.customFilters = {
+      enabled: true,
+      trustedScriptlets: true,
+      // Only filters from the managed storage are allowed
+      filterLists: {},
+    };
+  }
+
+  return options;
+}
+
+export function isGloballyPaused(options) {
+  return !!options.paused[GLOBAL_PAUSE_ID];
+}
+
+export async function revokeGlobalPause(options) {
+  await store.set(options, { paused: { [GLOBAL_PAUSE_ID]: null } });
+}
+
+export function getPausedDetails(options, hostname) {
+  if (!hostname) {
+    throw new Error('Hostname is required to get paused details');
+  }
+
+  if (isGloballyPaused(options)) {
+    return { revokeAt: 0 };
+  }
+
+  switch (options.mode) {
+    case MODE_DEFAULT: {
+      // The domain is paused when top domain is found in the record
+      const pausedHostname = findParentDomain(options.paused, hostname);
+      return pausedHostname ? options.paused[pausedHostname] : null;
+    }
+    case MODE_ZAP: {
+      // The domain is paused when top domain is not found in the record
+      const zappedHostname = findParentDomain(options.zapped, hostname);
+      return zappedHostname ? null : { revokeAt: 0 };
+    }
+    default:
+      return null;
+  }
+}

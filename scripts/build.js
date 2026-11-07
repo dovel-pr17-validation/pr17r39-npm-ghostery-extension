@@ -1,0 +1,757 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { resolve, dirname, join, basename } from 'node:path';
+import {
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  rmSync,
+  mkdirSync,
+  cpSync,
+  existsSync,
+} from 'node:fs';
+import { execSync } from 'node:child_process';
+import { build } from 'vite';
+import webExt from 'web-ext';
+
+import REGIONS from '../src/utils/regions.js';
+
+const pwd = process.cwd();
+
+const options = {
+  srcDir: resolve(pwd, 'src'),
+  outDir: resolve(pwd, 'dist'),
+  assets: ['_locales', 'icons', 'static_pages', 'background/rule_resources'],
+  pages: ['dnr-converter', 'logger', 'onboarding', 'whotracksme', 'whats-new'],
+};
+
+// Generate arguments from command line
+const argv = process.argv.slice(2).reduce(
+  (acc, arg) => {
+    if (arg.startsWith('--')) {
+      if (arg.includes('=')) {
+        const [key, value] = arg.slice(2).split('=');
+        acc[key] = value;
+      } else {
+        acc[arg.slice(2)] = true;
+      }
+    } else {
+      acc.target = arg;
+    }
+    return acc;
+  },
+  {
+    target: 'chromium',
+    debug: false,
+    staging: false,
+    silent: false,
+    clean: false,
+    watch: false,
+    automation: false,
+  },
+);
+
+// --- Automation patch ---
+function applyAutomationPatch(distDir) {
+  const manifestPath = resolve(distDir, 'manifest.json');
+  const m = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  m.name = 'Ghostery (Automation)';
+  m.short_name = 'Ghostery Automation';
+  writeFileSync(manifestPath, JSON.stringify(m, null, 2) + '\n');
+
+  const mcPath = resolve(distDir, 'store/managed-config.js');
+  const mc = readFileSync(mcPath, 'utf8');
+  const patched = mc.replace(/(disableOnboarding:\s*)false/, '$1true');
+  if (patched === mc) {
+    throw new Error('automation patch: did not find `disableOnboarding: false` in ' + mcPath);
+  }
+  writeFileSync(mcPath, patched);
+  if (!silent) {
+    console.log(
+      '--automation: patched manifest (Ghostery Automation) + managed-config (disableOnboarding=true)',
+    );
+  }
+}
+
+const pkg = JSON.parse(readFileSync(resolve(pwd, 'package.json'), 'utf8'));
+const silent = argv.silent;
+
+// Get manifest from source directory
+if (!silent) console.log(`Reading manifest.${argv.target}.json...`);
+
+const manifest = JSON.parse(
+  readFileSync(resolve(options.srcDir, `manifest.${argv.target}.json`), 'utf8'),
+);
+
+// Force re-download of resources to be sure we have the latest version
+// when building with staging CDN
+if (argv.staging) {
+  argv.clean = true;
+}
+// --- Download rule resources ---
+
+if (argv.clean) {
+  rmSync(resolve('src', 'rule_resources'), { recursive: true, force: true });
+}
+
+// DNR rules for Chromium-based browsers
+if (argv.target === 'chromium') {
+  execSync('node scripts/download-dnr-rulesets.js' + (argv.staging ? ' --staging' : ''), {
+    stdio: silent ? '' : 'inherit',
+  });
+
+  // Build redirect protection rules from downloaded DNR rulesets (MV3 only)
+  execSync('node scripts/build-redirect-protection-rules.js', {
+    stdio: silent ? '' : 'inherit',
+  });
+}
+
+execSync('node scripts/download-redirect-resources.js' + (argv.staging ? ' --staging' : ''), {
+  stdio: silent ? '' : 'inherit',
+});
+
+execSync('node scripts/download-wtm-bloomfilter.js', {
+  stdio: silent ? '' : 'inherit',
+});
+
+execSync('node scripts/download-wtm-stats.js', {
+  stdio: silent ? '' : 'inherit',
+});
+
+// --- Generate static pages ---
+
+const staticPath = resolve('src', 'static_pages');
+
+if (argv.clean) {
+  rmSync(staticPath, { recursive: true, force: true });
+}
+
+if (!existsSync(staticPath)) mkdirSync(staticPath, { recursive: true });
+
+// licenses.html...
+const licensesPath = resolve(staticPath, 'licenses.html');
+if (!existsSync(licensesPath)) {
+  writeFileSync(
+    licensesPath,
+    execSync(`npx license-report --config=scripts/license-report.json`)
+      .toString()
+      .replace(
+        '<html>',
+        `
+<html lang="en">
+  <head>
+    <title>Software Licenses</title>
+    <meta charset="utf-8">
+    <link rel="icon" type="image/png" href="/assets/favicon.png" />
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
+  </head>
+`,
+      )
+      .trim(),
+  );
+}
+
+// privacy-policy.html...
+if (argv.target !== 'firefox') {
+  const policyPath = resolve(staticPath, 'privacy-policy.html');
+  const url = `https://www.${argv.debug ? 'ghosterystage' : 'ghostery'}.com/privacy/policy?embed=true`;
+
+  if (!existsSync(policyPath)) {
+    const policy = await fetch(url);
+    if (policy.ok) {
+      const text = await policy.text();
+      writeFileSync(policyPath, text);
+    } else {
+      throw new Error(`Failed to fetch Privacy Policy from '${url}': ${policy.status}`);
+    }
+  }
+}
+
+// --- Download helper page ---
+
+// This page is used to trigger downloads in Safari,
+// as it does not support downloading files from the popup window
+if (argv.target !== 'firefox') {
+  options.pages.push('download');
+}
+
+// --- Base Vite Config ---
+
+const config = {
+  logLevel: silent ? 'silent' : undefined,
+  configFile: false,
+  root: options.srcDir,
+  resolve: {
+    mainFields: ['module', 'browser', 'jsnext:main', 'jsnext'],
+  },
+  define: {
+    // platforms
+    __CHROMIUM__: JSON.stringify(argv.target === 'chromium'),
+    __FIREFOX__: JSON.stringify(argv.target === 'firefox'),
+    // dev tools
+    __DEBUG__: JSON.stringify(argv.debug),
+    __STAGING__: JSON.stringify(argv.staging),
+  },
+  build: {
+    rolldownOptions: {
+      ...(argv.watch && {
+        onLog(level, log, handler) {
+          // Suppress FILE_NAME_CONFLICT warnings caused by the watch mode
+          // when files overwrite each other during the sequential builds.
+          if (log.code === 'FILE_NAME_CONFLICT') return;
+
+          handler(level, log);
+        },
+      }),
+    },
+    outDir: options.outDir,
+    assetsDir: '',
+    emptyOutDir: false,
+    minify: false,
+    reportCompressedSize: false,
+    modulePreload: {
+      polyfill: false,
+    },
+    watch: argv.watch
+      ? {
+          // VS Code editor can trigger multiple save events,
+          // so we add a small delay to prevent multiple builds in a row
+          buildDelay: 200,
+        }
+      : null,
+  },
+  plugins:
+    argv.target === 'firefox'
+      ? [
+          // Add Firefox polyfill banner to entry point files
+          {
+            name: 'firefox-entry-banner',
+            enforce: 'post',
+            generateBundle(_, bundle) {
+              for (const chunk of Object.values(bundle)) {
+                // MAIN world scripts must be self-contained, as every change
+                // to the page's environment is risky.
+                if (chunk.fileName.startsWith('content_scripts/main-world/')) continue;
+
+                if (chunk.type === 'chunk' && (chunk.isEntry || chunk.isDynamicEntry)) {
+                  chunk.code = 'globalThis.chrome = globalThis.browser;\n\n' + chunk.code;
+                }
+              }
+            },
+          },
+        ]
+      : [],
+};
+
+// --- Generate dist structure ---
+
+// generate dist folder
+rmSync(options.outDir, { recursive: true, force: true });
+mkdirSync(options.outDir, { recursive: true });
+
+// copy static assets
+options.assets.forEach((path) => {
+  mkdirSync(resolve(options.outDir, path), { recursive: true });
+  for (const file of readdirSync(resolve(options.srcDir, path))) {
+    cpSync(resolve(options.srcDir, path, file), resolve(options.outDir, path, file), {
+      recursive: true,
+    });
+  }
+});
+
+// copy managed storage configuration
+if (manifest.storage?.managed_schema) {
+  const path = resolve(options.srcDir, manifest.storage.managed_schema);
+  cpSync(path, resolve(options.outDir, manifest.storage.managed_schema));
+}
+
+// copy declarative net request lists
+if (manifest.declarative_net_request?.rule_resources) {
+  mkdirSync(resolve(options.outDir, 'rule_resources'), { recursive: true });
+
+  REGIONS.forEach((region) => {
+    manifest.declarative_net_request.rule_resources.push({
+      id: `lang-${region}`,
+      enabled: false,
+      path: `rule_resources/dnr-lang-${region}.json`,
+    });
+  });
+
+  manifest.declarative_net_request.rule_resources.forEach(({ path }) => {
+    const dir = dirname(path);
+    const file = basename(path);
+    const sourcePath = resolve(options.srcDir, path);
+    const destPath = resolve(options.outDir, dir);
+    const outputPath = resolve(destPath, file);
+    const metaSourcePath = sourcePath.replace('.json', '.metadata.json');
+    const metaOutputPath = outputPath.replace('.json', '.metadata.json');
+
+    mkdirSync(destPath, { recursive: true });
+    cpSync(sourcePath, outputPath);
+
+    if (existsSync(metaSourcePath)) {
+      cpSync(metaSourcePath, metaOutputPath);
+    }
+  });
+}
+
+// copy whotracksme configuration files
+mkdirSync(resolve(options.outDir, 'rule_resources'), { recursive: true });
+cpSync(
+  resolve(options.srcDir, 'rule_resources', 'whotracksme'),
+  resolve(options.outDir, 'rule_resources', 'whotracksme'),
+  { recursive: true },
+);
+
+// copy redirect rule resources
+mkdirSync(resolve(options.outDir, 'rule_resources/redirects'), {
+  recursive: true,
+});
+for (const file of readdirSync(resolve(options.srcDir, 'rule_resources', 'redirects'))) {
+  if (argv.target !== 'firefox' && file.includes('MIME_TYPE_STUB')) {
+    continue;
+  }
+  cpSync(
+    resolve(options.srcDir, 'rule_resources', 'redirects', file),
+    resolve(options.outDir, 'rule_resources', 'redirects', file),
+  );
+}
+
+// append web_accessible_resources
+const redirectResources = readdirSync(resolve(options.outDir, 'rule_resources/redirects'));
+
+if (manifest.manifest_version === 3) {
+  manifest.web_accessible_resources.push({
+    resources: redirectResources.map((filename) => join('rule_resources/redirects', filename)),
+    matches: ['<all_urls>'],
+    use_dynamic_url: true,
+  });
+} else {
+  redirectResources.forEach((filename) => {
+    manifest.web_accessible_resources.push(join('rule_resources/redirects', filename));
+  });
+}
+
+// --- Generate entry points ---
+
+const source = options.pages.map((page) => `pages/${page}/index.html`);
+const content_scripts = [];
+
+if (manifest.action?.default_popup) {
+  source.push(manifest.action.default_popup);
+}
+
+if (manifest.browser_action?.default_popup) {
+  source.push(manifest.browser_action.default_popup);
+}
+
+// options page
+if (manifest.options_ui?.page) {
+  source.push(manifest.options_ui?.page);
+}
+
+// content scripts
+manifest.content_scripts = manifest.content_scripts.filter(({ js = [], css = [], run_at }) => {
+  [...js, ...css].forEach((src) => content_scripts.push(src));
+  return run_at !== 'background_execute_script';
+});
+
+// web-accessible resources
+manifest.web_accessible_resources?.forEach((entry) => {
+  const paths = [];
+
+  if (typeof entry === 'string') {
+    paths.push(entry);
+  } else {
+    entry.resources.forEach((src) => paths.push(src));
+  }
+
+  paths.forEach((path) => {
+    if (path.includes('/redirects/')) return;
+
+    if (path.match(/\.(html)$/)) {
+      source.push(path);
+    } else if (path.match(/\.(js)$/)) {
+      content_scripts.push(path);
+    } else {
+      throw new Error(`Unsupported web_accessible_resource: ${path}`);
+    }
+  });
+});
+
+// background
+if (manifest.background) {
+  source.push(manifest.background.service_worker || manifest.background.scripts[0]);
+}
+
+// --- Save manifest ---
+
+// set manifest version from package.json
+manifest.version = pkg.version;
+
+if (manifest.permissions.includes('declarativeNetRequest') && argv.watch) {
+  manifest.permissions.push('declarativeNetRequestFeedback');
+}
+
+writeFileSync(resolve(options.outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+
+// --- Build  ---
+
+function mapPaths(paths) {
+  return paths.reduce((acc, src) => {
+    acc[src.replace(/\.js/, '')] = src.startsWith('node_modules')
+      ? resolve(src)
+      : resolve(options.srcDir, src);
+    return acc;
+  }, {});
+}
+
+const PATH_LIMIT = 110;
+const MIN_SHORTEN_BASE = 6;
+
+function splitSegment(segment) {
+  const dotIdx = segment.lastIndexOf('.');
+  if (dotIdx <= 0) return { base: segment, ext: '' };
+  return { base: segment.slice(0, dotIdx), ext: segment.slice(dotIdx) };
+}
+
+let shortNameCounter = 0;
+const shortNameBySegment = new Map();
+const originalByOutput = new Map();
+
+// Rename the longest segments to short counter values: "0", "1", ..., "z", "10", ...
+function shortenPath(path, limit) {
+  const segments = path.split('/');
+
+  while (segments.join('/').length > limit) {
+    let longestIdx = -1;
+    let longestLength = MIN_SHORTEN_BASE;
+
+    for (let i = 0; i < segments.length; i++) {
+      const { base } = splitSegment(segments[i]);
+      if (base.length > longestLength) {
+        longestLength = base.length;
+        longestIdx = i;
+      }
+    }
+
+    if (longestIdx === -1) break;
+
+    const segment = segments[longestIdx];
+    let short = shortNameBySegment.get(segment);
+    if (short === undefined) {
+      short = (shortNameCounter++).toString(36) + splitSegment(segment).ext;
+      shortNameBySegment.set(segment, short);
+    }
+    segments[longestIdx] = short;
+  }
+
+  return segments.join('/');
+}
+
+// If a short name collides with a real file, append "-1", "-2", ... until unique.
+function makeUnique(path, original) {
+  const taken = (candidate) =>
+    originalByOutput.has(candidate) && originalByOutput.get(candidate) !== original;
+
+  if (!taken(path)) return path;
+
+  const slash = path.lastIndexOf('/');
+  const dir = path.slice(0, slash + 1);
+  const { base, ext } = splitSegment(path.slice(slash + 1));
+
+  let suffix = 1;
+  let candidate = `${dir}${base}-${suffix}${ext}`;
+  while (taken(candidate)) {
+    suffix += 1;
+    candidate = `${dir}${base}-${suffix}${ext}`;
+  }
+  return candidate;
+}
+
+const buildPromise = build({
+  ...config,
+  build: {
+    ...config.build,
+    target: 'esnext',
+    rolldownOptions: {
+      ...config.build.rolldownOptions,
+      input: mapPaths(source),
+      external: [
+        // Prevents from processing re2-wasm deep dependency of the @ghostery/urlfilter2dnr package
+        // The library is not used in the final code
+        '@adguard/re2-wasm',
+        // Prevents from loading canvas dependency of linkedom
+        'canvas',
+      ],
+      output: {
+        dir: options.outDir,
+        preserveModules: true,
+        preserveModulesRoot: 'src',
+        virtualDirname: 'virtual',
+        minifyInternalExports: false,
+        entryFileNames: (chunk) =>
+          `${chunk.name.replace(/\.(png|jpg|jpeg|gif|svg|webp)$/, '').replace(/\?[^.]*$/, '')}.js`,
+
+        assetFileNames: 'assets/[name]-[hash].[ext]',
+        sanitizeFileName: (name) => {
+          name = name
+            .replace(/[\0?*]+/g, '_')
+            .replace(/["<>:|]/g, '_')
+            .replace(/node_modules/g, 'npm');
+
+          const hasPwd = name.startsWith(pwd);
+          const original = hasPwd ? name.slice(pwd.length) : name;
+          let relPath = original;
+
+          if (relPath.length > PATH_LIMIT) {
+            relPath = makeUnique(shortenPath(relPath, PATH_LIMIT), original);
+            name = hasPwd ? pwd + relPath : relPath;
+          }
+
+          const claimed = originalByOutput.get(relPath);
+          if (claimed !== undefined && claimed !== original) {
+            throw new Error(
+              `Path collision: "${original}" and "${claimed}" both map to "${relPath}"`,
+            );
+          }
+          originalByOutput.set(relPath, original);
+
+          if (relPath.length > PATH_LIMIT && !argv['no-filename-limit']) {
+            throw new Error(
+              `Filename too long: ${relPath} (${relPath.length}) (pass --no-filename-limit to disable; for instance, "npm run build -- --no-filename-limit")`,
+            );
+          }
+
+          return name;
+        },
+      },
+    },
+  },
+  plugins: [
+    ...config.plugins,
+
+    {
+      name: 'shortened-path-banner',
+      buildStart() {
+        shortNameCounter = 0;
+        shortNameBySegment.clear();
+        originalByOutput.clear();
+      },
+      generateBundle(_, bundle) {
+        for (const [fileName, chunk] of Object.entries(bundle)) {
+          if (chunk.type !== 'chunk') continue;
+          const outputPath = '/' + fileName;
+          const original = originalByOutput.get(outputPath);
+          if (original && original !== outputPath) {
+            chunk.code = `/* original: ${original} */\n` + chunk.code;
+          }
+        }
+      },
+    },
+    // Keep offscreen documents from @whotracksme/reporting
+    {
+      name: 'copy-reporting-assets',
+      buildStart() {
+        const srcDir = resolve(
+          process.cwd(),
+          'node_modules/@whotracksme/reporting/reporting/src/offscreen/doublefetch/',
+        );
+        const outDir = resolve(process.cwd(), 'dist/offscreen/doublefetch/');
+        if (!existsSync(outDir)) {
+          mkdirSync(outDir, { recursive: true });
+        }
+        const files = readdirSync(srcDir);
+        files.forEach((file) => {
+          cpSync(resolve(srcDir, file), resolve(outDir, file));
+        });
+      },
+    },
+
+    // Fix circular CJS dependencies (e.g. cssom) broken by preserveModules.
+    // Rolldown emits `export default require_X()` which eagerly evaluates CJS
+    // wrappers during module init, triggering circular calls. The named export
+    // `require_X` (the lazy wrapper function) is sufficient for all consumers.
+    {
+      name: 'fix-circular-cjs',
+      generateBundle(options, bundle) {
+        for (const chunk of Object.values(bundle)) {
+          if (chunk.type !== 'chunk') continue;
+          if (!chunk.code.includes('__commonJSMin')) continue;
+          // Remove `export default require_X();` — keep only the named export
+          chunk.code = chunk.code.replace(/^export default require_\w+\(\);\n?/m, '');
+        }
+      },
+    },
+
+    // This custom plugin cleans up chunk imports of the `.html` inputs
+    // to prevent Vite from adding <script> tags for every transitive JS module.
+    // It collects CSS from the full import tree first, then strips JS imports
+    // and annotates the entry chunk with the collected CSS so Vite still adds <link> tags.
+    // It also removes `.css.js` imports from all chunks since CSS is handled via <link> tags.
+    {
+      name: 'clean-up-html-imports',
+      enforce: 'pre',
+      generateBundle(_, bundle) {
+        // Map each CSS source module to its emitted CSS asset(s). With
+        // `preserveModules`, every imported `.css` file becomes its own
+        // `.css.js` chunk whose `facadeModuleId` points back to the source
+        // module, which lets us derive ordering from the real module graph.
+        const cssModuleToAssets = new Map();
+        for (const c of Object.values(bundle)) {
+          if (
+            c.type === 'chunk' &&
+            c.facadeModuleId?.replace(/\?.*$/, '').endsWith('.css') &&
+            c.viteMetadata?.importedCss?.size
+          ) {
+            cssModuleToAssets.set(c.facadeModuleId.replace(/\?.*$/, ''), [
+              ...c.viteMetadata.importedCss,
+            ]);
+          }
+        }
+
+        for (const chunk of Object.values(bundle)) {
+          if (chunk.fileName.endsWith('.html.js')) {
+            for (const name of chunk.imports) {
+              const importChunk = bundle[name];
+              if (importChunk?.type === 'chunk') {
+                // Collect CSS in module execution order (dependencies first) by
+                // walking the module graph in source-import order. This keeps
+                // shared styles (e.g. `/ui/styles.css`) before page-specific
+                // styles so the cascade is correct, regardless of how chunks are
+                // named or sorted.
+                const orderedCss = new Set();
+                const visited = new Set();
+                const walk = (moduleId) => {
+                  const id = moduleId.replace(/\?.*$/, '');
+                  if (visited.has(id)) return;
+                  visited.add(id);
+
+                  const info = this.getModuleInfo(moduleId);
+                  if (info) {
+                    for (const importedId of info.importedIds) {
+                      walk(importedId);
+                    }
+                  }
+
+                  const assets = cssModuleToAssets.get(id);
+                  if (assets) {
+                    for (const asset of assets) orderedCss.add(asset);
+                  }
+                };
+                if (importChunk.facadeModuleId) walk(importChunk.facadeModuleId);
+
+                importChunk.imports = importChunk.imports.filter((name) =>
+                  name.endsWith('.css.js'),
+                );
+
+                // Preserve collected CSS on this chunk so Vite adds <link> tags
+                if (orderedCss.size > 0 && importChunk.viteMetadata) {
+                  importChunk.viteMetadata.importedCss = orderedCss;
+                }
+              }
+            }
+          }
+        }
+      },
+    },
+  ],
+});
+
+// --- Build content scripts ---
+
+const contentScriptBuilds = [];
+for (const [id, path] of Object.entries(mapPaths(content_scripts))) {
+  // Copy assets
+  if (!path.endsWith('.js')) {
+    mkdirSync(resolve(options.outDir, id.split('/').slice(0, -1).join('/')), {
+      recursive: true,
+    });
+    cpSync(path, resolve(options.outDir, id));
+  } else {
+    // build content scripts
+    contentScriptBuilds.push(
+      build({
+        ...config,
+        build: {
+          ...config.build,
+          target: 'esnext',
+          rolldownOptions: {
+            ...config.build.rolldownOptions,
+            input: { [id]: path },
+            output: {
+              format: 'iife',
+              dir: options.outDir,
+              entryFileNames: '[name].js',
+            },
+          },
+        },
+      }),
+    );
+  }
+}
+
+if (argv.automation && !argv.watch) {
+  await Promise.all([buildPromise, ...contentScriptBuilds]);
+  applyAutomationPatch(options.outDir);
+}
+
+if (argv.watch) {
+  buildPromise.then((watchEmitter) =>
+    watchEmitter.on('event', function callback(e) {
+      if (e.code === 'BUNDLE_END') {
+        watchEmitter.off('event', callback);
+
+        let settings;
+        switch (argv.target) {
+          case 'firefox':
+            settings = {
+              target: 'firefox-desktop',
+              devtools: true,
+              pref: {
+                'intl.locale.requested': 'en-US',
+                'intl.accept_languages': 'en-US, en',
+              },
+            };
+            break;
+          case 'chromium': {
+            settings = { target: 'chromium' };
+
+            switch (argv.browser) {
+              case 'brave':
+                settings.chromiumBinary =
+                  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
+                break;
+              case 'edge':
+                settings.chromiumBinary =
+                  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
+                break;
+              case 'opera':
+                settings.chromiumBinary = '/Applications/Opera.app/Contents/MacOS/Opera';
+                break;
+            }
+
+            break;
+          }
+          default:
+            break;
+        }
+
+        webExt.cmd.run({
+          ...settings,
+          noReload: true,
+          sourceDir: options.outDir,
+        });
+      }
+    }),
+  );
+}

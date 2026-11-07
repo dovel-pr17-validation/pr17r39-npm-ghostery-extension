@@ -1,0 +1,46 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import '/ui/localize.js';
+
+import './onboarding.js';
+import './config.js';
+
+import './adblocker/index.js';
+import './never-consent/index.js';
+import './browsing-data.js';
+import './custom-filters/index.js';
+import './distractions.js';
+import './element-picker.js';
+import './dnr.js';
+import './redirect-protection.js';
+import './exceptions.js';
+import './context-menu.js';
+import './paused.js';
+import './zapped.js';
+import './stats.js';
+import './action.js';
+import './notifications.js';
+import './serp.js';
+import './report-issue.js';
+import './pause-assistant.js';
+import './youtube.js';
+
+import './whats-new.js';
+
+import './helpers.js';
+import './sync.js';
+
+import './reporting/index.js';
+import './telemetry/index.js';
+
+import './devtools.js';
+import './storage.js';

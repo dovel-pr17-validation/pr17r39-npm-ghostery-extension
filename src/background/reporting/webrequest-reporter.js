@@ -1,0 +1,82 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { store } from 'hybrids';
+import { RequestReporter } from '@whotracksme/reporting/reporting';
+import { ACTION_DISABLE_ANTITRACKING_MODIFICATION } from '@ghostery/config';
+
+import Options, { getPausedDetails } from '/store/options.js';
+import Config from '/store/config.js';
+import FilteringDebug from '/store/filtering-debug.js';
+
+import Request from '/utils/request.js';
+
+import { updateTabStats } from '../stats.js';
+
+import config from './config.js';
+import communication from './communication.js';
+import urlReporter, { pauseState } from './url-reporter.js';
+
+let webRequestReporter = null;
+
+if (chrome.webRequest) {
+  let remoteConfig;
+  store.resolve(Config).then((remote) => {
+    remoteConfig = remote;
+  });
+
+  try {
+    webRequestReporter = new RequestReporter(config.request, {
+      onMessageReady: urlReporter.forwardRequestReporterMessage.bind(urlReporter),
+      countryProvider: urlReporter.countryProvider,
+      trustedClock: communication.trustedClock,
+      pauseState,
+      isRequestAllowed: (state) => {
+        const options = store.get(Options);
+        const hostname = state.tabUrlParts.hostname;
+
+        const debug = store.get(FilteringDebug);
+        if (store.ready(debug) && !debug.antitracking) {
+          return true;
+        }
+
+        return (
+          !options.blockTrackers ||
+          !!getPausedDetails(options, hostname) ||
+          remoteConfig?.hasAction(hostname, ACTION_DISABLE_ANTITRACKING_MODIFICATION)
+        );
+      },
+      onTrackerInteraction: (event, state) => {
+        if (event === 'observed') {
+          return;
+        }
+
+        const request = Request.fromRequestDetails({
+          url: state.url,
+          originUrl: state.tabUrl,
+        });
+        request.modified = true;
+
+        updateTabStats(state.tabId, request);
+      },
+    });
+
+    chrome.runtime.onMessage.addListener((msg, sender) => {
+      if (msg.action === 'mousedown') {
+        webRequestReporter.recordClick(msg.event, msg.context, msg.href, sender);
+      }
+    });
+  } catch (e) {
+    console.warn('Failed to create webRequestReporter. Leaving it disabled.', e);
+  }
+}
+
+export default webRequestReporter;

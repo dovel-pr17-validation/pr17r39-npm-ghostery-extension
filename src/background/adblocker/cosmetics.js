@@ -1,0 +1,449 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { store } from 'hybrids';
+import scriptlets, { run } from '@ghostery/scriptlets';
+
+import Options, { getPausedDetails } from '/store/options.js';
+import TabStats from '/store/tab-stats.js';
+import DisabledFilters from '/store/disabled-filters.js';
+import FilteringDebug from '/store/filtering-debug.js';
+
+import * as engines from '/utils/engines.js';
+import * as OptionsObserver from '/utils/options-observer.js';
+import { parseWithCache } from '/utils/request.js';
+import { isUserScriptsSupported } from '/utils/user-scripts.js';
+
+import { setup } from './engines.js';
+import { contentScripts } from './content-scripts.js';
+import { FramesHierarchy } from './ancestors.js';
+
+function resolveInjectionTarget(details) {
+  const target = { tabId: details.tabId };
+
+  if (__CHROMIUM__ && details.documentId) {
+    target.documentIds = [details.documentId];
+  } else {
+    target.frameIds = [details.frameId];
+  }
+
+  return target;
+}
+
+const scriptletGlobals = {
+  // Request a real extension resource to obtain a dynamic ID to the resource.
+  // Redirect resources are defined with `use_dynamic_url` restriction.
+  // The dynamic ID is generated per session.
+  // refs https://developer.chrome.com/docs/extensions/reference/manifest/web-accessible-resources#manifest_declaration
+  warOrigin: chrome.runtime.getURL('/rule_resources/redirects/empty').slice(0, -6),
+};
+
+const USER_SCRIPTS = __CHROMIUM__ && isUserScriptsSupported();
+
+// Registered scripts take code, so run() is serialized once; executeScript() takes it as is.
+const runPrefix = `(${run})(${JSON.stringify(scriptletGlobals)}, `;
+const runCode = (calls) => `${runPrefix}${JSON.stringify(calls)});`;
+
+// On Chromium both webNavigation.onCommitted and webRequest.onResponseStarted fire for the
+// same document, so scriptlets would run twice. We remember the documentIds we have already
+// injected into (proved by executeScript's result) and skip a repeat. The in-memory set gives
+// a synchronous check that closes the race between the two triggers; session storage keeps it
+// across service-worker restarts.
+const INJECTED_DOCUMENTS_KEY = 'injectedScriptletDocuments';
+const injectedDocuments = new Set();
+
+if (__CHROMIUM__) {
+  chrome.storage.session
+    .get(INJECTED_DOCUMENTS_KEY)
+    .then((stored) => {
+      for (const id of stored[INJECTED_DOCUMENTS_KEY] || []) injectedDocuments.add(id);
+    })
+    .catch(() => {});
+}
+
+function rememberInjectedDocument(documentId) {
+  injectedDocuments.add(documentId);
+  if (injectedDocuments.size > 1000) {
+    injectedDocuments.delete(injectedDocuments.values().next().value);
+  }
+  chrome.storage.session.set({ [INJECTED_DOCUMENTS_KEY]: [...injectedDocuments] }).catch(() => {});
+}
+
+// Filter lists percent-encode characters like "," that would otherwise split arguments,
+// which the adblocker's own injection template decodes as well. A malformed sequence
+// falls back to the raw value, as throwing here would abort the injection for the page.
+function decodeArgument(arg) {
+  try {
+    return decodeURIComponent(arg);
+  } catch {
+    return arg;
+  }
+}
+
+async function injectScriptlets(filters, hostname, domain, details) {
+  // Unlike Firefox's contentScripts (matchAboutBlank), chrome.userScripts cannot reach
+  // local frames (about:blank, srcdoc), so their documents are injected per-frame.
+  const useRegistry = __FIREFOX__ || (USER_SCRIPTS && !details.localFrame);
+
+  if (__CHROMIUM__) {
+    if (filters.length === 0 && !useRegistry) return;
+    if (details.documentId) {
+      if (injectedDocuments.has(details.documentId)) return;
+      injectedDocuments.add(details.documentId);
+    }
+  }
+
+  const scriptletsByWorld = { MAIN: '', ISOLATED: '' };
+  // The scriptlets of a world share one scope, so dependencies such as safeSelf() and its
+  // cache are declared once (as in uBO) instead of once per scriptlet.
+  const calls = { register: { MAIN: [], ISOLATED: [] }, execute: { MAIN: [], ISOLATED: [] } };
+  const injections = [];
+  for (const filter of filters) {
+    const parsed = filter.parseScript();
+
+    if (!parsed) {
+      console.warn('[adblocker] could not inject script filter:', filter.toString());
+      continue;
+    }
+
+    const scriptletName = `${parsed.name}${parsed.name.endsWith('.js') ? '' : '.js'}`;
+    const scriptlet = scriptlets[scriptletName];
+
+    if (!scriptlet) {
+      console.warn('[adblocker] unknown scriptlet with name:', scriptletName);
+      continue;
+    }
+
+    const args = parsed.args.map(decodeArgument);
+    const declaredWorld = scriptlet.world === 'ISOLATED' ? 'ISOLATED' : 'MAIN';
+
+    // A filter matching this frame by its own hostname is registered (document_start); a
+    // per-hostname registration can't reach a cross-origin child, so an ancestor-only (>>)
+    // match injects per-frame below.
+    const registered = useRegistry && filter.match(hostname, domain);
+
+    calls[registered ? 'register' : 'execute'][declaredWorld].push([scriptlet.fn, ...args]);
+  }
+
+  for (const world of ['MAIN', 'ISOLATED']) {
+    if (calls.register[world].length) {
+      scriptletsByWorld[world] = runCode(calls.register[world]);
+    }
+    if (calls.execute[world].length === 0) continue;
+
+    injections.push(
+      chrome.scripting
+        .executeScript({
+          injectImmediately: true,
+          world,
+          target: resolveInjectionTarget(details),
+          func: run,
+          args: [scriptletGlobals, calls.execute[world]],
+        })
+        .catch((e) => {
+          console.warn(e);
+          return null;
+        }),
+    );
+  }
+
+  if (useRegistry) {
+    if (scriptletsByWorld.MAIN || scriptletsByWorld.ISOLATED) {
+      if (!contentScripts.isRegistered(hostname)) {
+        contentScripts.register(hostname, scriptletsByWorld);
+      }
+    } else {
+      contentScripts.unregister(hostname);
+    }
+  }
+
+  if (__FIREFOX__) return;
+
+  // The documentId echoed back by executeScript proves the injection landed; persist it so
+  // the dedup outlives a service-worker restart. If nothing landed, release the reservation.
+  const results = await Promise.all(injections);
+  const injectedDocumentId = results.flat().find((result) => result?.documentId)?.documentId;
+
+  if (injectedDocumentId) {
+    rememberInjectedDocument(injectedDocumentId);
+  } else if (details.documentId) {
+    injectedDocuments.delete(details.documentId);
+  }
+}
+
+function injectStyles(styles, details) {
+  chrome.scripting
+    .insertCSS({
+      css: styles,
+      origin: 'USER',
+      target: resolveInjectionTarget(details),
+    })
+    .catch(async (e) => {
+      // On Firefox, "Missing host permission for the tab or frames" is produced
+      // whenever the target frame is destroyed before the browser completes the
+      // CSS injection, regardless of how the injection was triggered.
+      if (__FIREFOX__ && e?.message?.startsWith('Missing host permission')) return;
+
+      // Only log a warning if the frame still exists, otherwise it means that
+      // the frame is destroyed before the CSS is injected.
+      const frame = await chrome.webNavigation
+        .getFrame({ tabId: details.tabId, frameId: details.frameId })
+        .catch(() => null);
+
+      if (!frame) return;
+
+      // On Chromium, when documentId is used as the injection target, verify the
+      // frame's current document matches. If it differs, the frame navigated to a
+      // new document after onCommitted fired but before insertCSS ran (benign race).
+      if (__CHROMIUM__ && details.documentId && frame.documentId !== details.documentId) return;
+
+      console.warn('[adblocker] failed to inject CSS', e);
+    });
+}
+
+const framesHierarchy = new FramesHierarchy();
+framesHierarchy.handleWebWorkerStart();
+framesHierarchy.handleWebextensionEvents();
+
+/*
+ * returns `false` if the injection should be blocked for the given hostname
+ * otherwise returns `undefined` and performs necessary preparations for the injection
+ * (like registering content scripts for scriptlet filters on Firefox)
+ */
+async function injectCosmetics(details, config) {
+  const { bootstrap: isBootstrap = false, scriptletsOnly } = config;
+
+  try {
+    setup.pending && (await setup.pending);
+  } catch (e) {
+    console.error('[adblocker] not ready for cosmetic injection', e);
+    return;
+  }
+
+  const { tabId, frameId, parentFrameId, documentId, url } = details;
+
+  const parsed = parseWithCache(url);
+  const domain = parsed.domain || '';
+  const hostname = parsed.hostname || '';
+
+  if ((__FIREFOX__ || USER_SCRIPTS) && scriptletsOnly && contentScripts.isRegistered(hostname)) {
+    return;
+  }
+
+  const options = store.get(Options);
+
+  // Paused or not zapped hostname
+  if (getPausedDetails(options, hostname)) {
+    return false;
+  }
+
+  // Checking the tab hostname to cover local iframes without a proper URL (about:blank, data:, etc.)
+  // or iframes with different hostname than the tab's
+  if (frameId !== 0) {
+    const { hostname: tabHostname } = await store.resolve(TabStats, tabId);
+    if (tabHostname && getPausedDetails(options, tabHostname)) {
+      return false;
+    }
+  }
+
+  const engine = engines.get(engines.MAIN_ENGINE);
+
+  const debug = store.get(FilteringDebug);
+  const debugReady = store.ready(debug);
+  const cssEnabled = !debugReady || debug.cosmeticsCSS;
+  const scriptletsEnabled = !debugReady || debug.cosmeticsScriptlets;
+  const extendedCSSEnabled = !debugReady || debug.cosmeticsExtendedCSS;
+
+  let ancestors;
+  if (!scriptletsOnly) {
+    if (typeof parentFrameId === 'number') {
+      framesHierarchy.updateAncestry(
+        { tabId, frameId, parentFrameId, documentId },
+        { domain, hostname },
+      );
+
+      if (!__FIREFOX__) {
+        ancestors = framesHierarchy.ancestorsOf(tabId, frameId);
+      }
+    } else if (__FIREFOX__ && isBootstrap) {
+      // On Firefox, subframe (>>) filters are evaluated only at the bootstrap message: it comes
+      // from the frame's final document, while at onCommitted an out-of-process frame's document
+      // is still provisional, so an executeScript into it is discarded along with that document.
+      ancestors = framesHierarchy.ancestorsOf(tabId, frameId);
+    }
+  }
+
+  // Domain specific cosmetic filters (scriptlets and styles)
+  // Execution: bootstrap, DOM mutations
+  {
+    const { matches } = engine.matchCosmeticFilters({
+      domain,
+      hostname,
+      url,
+      ancestors,
+
+      classes: config.classes,
+      hrefs: config.hrefs,
+      ids: config.ids,
+
+      // This needs to be done only once per frame
+      getInjectionRules: isBootstrap,
+      getExtendedRules: isBootstrap,
+      getRulesFromHostname: isBootstrap,
+
+      getPureHasRules: true,
+
+      // This will be done every time we get information about DOM mutation
+      getRulesFromDOM: !isBootstrap,
+      callerContext: { tabId },
+    });
+
+    const styleFilters = [];
+    const scriptFilters = [];
+
+    const disabledFilters = store.get(DisabledFilters);
+
+    for (const { filter, exception } of matches) {
+      if (exception !== undefined) continue;
+      if (store.ready(disabledFilters) && disabledFilters.ids[filter.getId()]) continue;
+
+      if (filter.isScriptInject()) {
+        scriptFilters.push(filter);
+      } else {
+        styleFilters.push(filter);
+      }
+    }
+
+    if (isBootstrap) {
+      injectScriptlets(scriptletsEnabled ? scriptFilters : [], hostname, domain, details);
+    }
+
+    if (scriptletsOnly) {
+      return;
+    }
+
+    const { styles, extended } = engine.injectCosmeticFilters(styleFilters, {
+      url,
+      injectScriptlets: isBootstrap,
+      injectExtended: isBootstrap,
+      injectPureHasSafely: true,
+      allowGenericHides: false,
+      getBaseRules: false,
+    });
+
+    if (styles && cssEnabled) {
+      injectStyles(styles, details);
+    }
+
+    if (extended && extended.length > 0 && extendedCSSEnabled) {
+      chrome.tabs
+        .sendMessage(tabId, { action: 'evaluateExtendedSelectors', extended }, { frameId })
+        // In case the frame is destroyed before the message is delivered, we can get an error
+        .catch(() => {});
+    }
+  }
+
+  // Global cosmetic filters (styles only)
+  // Execution: bootstrap
+  if (isBootstrap && cssEnabled) {
+    const { styles } = engine.getCosmeticsFilters({
+      domain,
+      hostname,
+      url,
+      getBaseRules: true,
+      getInjectionRules: false,
+      getExtendedRules: false,
+      getRulesFromDOM: false,
+      getRulesFromHostname: false,
+    });
+
+    injectStyles(styles, details);
+  }
+}
+
+/*
+ * Cosmetic filtering
+ */
+
+// Inject cosmetics on navigation committed (All platforms supported)
+chrome.webNavigation.onCommitted.addListener(
+  (details) => injectCosmetics(details, { bootstrap: true }),
+  { url: [{ urlPrefix: 'http://' }, { urlPrefix: 'https://' }] },
+);
+
+// Listen for requests from content scripts to inject
+// dynamic cosmetics (All platforms supported)
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action === 'injectCosmetics' && sender.tab) {
+    // Generate details object for the sender argument
+
+    // Resolve url for the frame/subframe
+    // Local frames (about:blank, data:, etc.) do not have a proper URL
+    const localFrame = !sender.url.startsWith('http');
+    const url = localFrame ? sender.origin : sender.url;
+
+    const details = {
+      url,
+      tabId: sender.tab.id,
+      frameId: sender.frameId,
+      documentId: sender.documentId,
+      localFrame,
+    };
+
+    injectCosmetics(details, msg).then(sendResponse);
+
+    return true;
+  }
+});
+
+if (__FIREFOX__ || USER_SCRIPTS) {
+  OptionsObserver.addListener('paused', function contentScriptScriptlets(paused, lastPaused) {
+    if (!lastPaused) return; // skipped on startup (persisted registrations are still valid)
+
+    if (paused['<all_urls>']) {
+      // Paused keys are not registered hostnames (`<all_urls>` globally, parent domains per site),
+      // so drop every registration and let the next navigation re-register what is still allowed.
+      contentScripts.unregisterAll();
+    } else {
+      for (const hostname of Object.keys(paused)) {
+        contentScripts.unregister(hostname);
+      }
+    }
+  });
+
+  chrome.webNavigation.onBeforeNavigate.addListener(
+    (details) => {
+      injectCosmetics(details, { bootstrap: true, scriptletsOnly: true });
+    },
+    { url: [{ urlPrefix: 'http://' }, { urlPrefix: 'https://' }] },
+  );
+}
+
+if (!__FIREFOX__) {
+  chrome.webRequest?.onResponseStarted.addListener(
+    (details) => {
+      if (details.tabId === -1) return;
+      if (details.type !== 'main_frame' && details.type !== 'sub_frame') return;
+
+      if (!details.documentId) return;
+
+      injectCosmetics(details, { bootstrap: true });
+    },
+    { urls: ['http://*/*', 'https://*/*'] },
+  );
+}
+
+if (USER_SCRIPTS) {
+  // Registrations persist across restarts; engine changes refresh them in reloadMainEngine().
+  const refresh = () => contentScripts.unregisterAll();
+  chrome.runtime.onStartup.addListener(refresh);
+  chrome.runtime.onInstalled.addListener(refresh);
+}

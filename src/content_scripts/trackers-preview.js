@@ -1,0 +1,218 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { drawWheel } from '/ui/wheel.js';
+import { isFromExtensionFrame } from '/utils/messaging.js';
+import { getDestination } from '/utils/link-destinations.js';
+
+const WRAPPER_CLASS = 'wtm-popup-iframe-wrapper';
+
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+function closePopups() {
+  [...document.querySelectorAll(`.${WRAPPER_CLASS}`)].forEach((popup) => {
+    popup.parentElement.removeChild(popup);
+  });
+}
+
+function resizePopup(height) {
+  [...document.querySelectorAll(`.${WRAPPER_CLASS}`)].forEach((popup) => {
+    popup.style.height = `${height}px`;
+  });
+}
+
+const getTop = (el) => el.offsetTop + (el.offsetParent && getTop(el.offsetParent));
+
+function renderPopup(container, stats, popupUrl) {
+  closePopups();
+
+  const wrapper = document.createElement('div');
+  wrapper.classList.add(WRAPPER_CLASS);
+  if (isMobile) {
+    wrapper.style.width = window.innerWidth - 20 + 'px';
+    wrapper.style.left = '10px';
+  } else {
+    const left = container.getBoundingClientRect().left - 350 / 2 + 12;
+    wrapper.style.left = (left < 20 ? 20 : left) + 'px';
+  }
+  wrapper.style.top = getTop(container) + 25 + 'px';
+
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('src', `${popupUrl}?domain=${stats.domain}`);
+
+  wrapper.appendChild(iframe);
+  document.body.appendChild(wrapper);
+}
+
+function getWheelElement(stats, popupUrl) {
+  const count = stats.stats.length;
+
+  if (count === 0) {
+    return null;
+  }
+
+  const container = document.createElement('div');
+  container.classList.add('wtm-tracker-wheel-container');
+
+  const label = document.createElement('div');
+  label.innerText = count;
+
+  const canvas = document.createElement('canvas');
+  canvas.classList.add('wtm-tracker-wheel');
+
+  const ctx = canvas.getContext('2d');
+  drawWheel(ctx, 16, stats.stats);
+
+  container.appendChild(canvas);
+  container.appendChild(label);
+
+  container.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+
+    renderPopup(container, stats, popupUrl);
+  });
+
+  return container;
+}
+
+const SELECTORS = [
+  // Google
+  '[data-hveid] div.yuRUbf > div > span > a',
+  '[data-hveid] div.yuRUbf > div > a',
+  '[data-hveid] div.xpd a.cz3goc',
+  '[data-hveid] > .xpd > div.kCrYT:first-child > a',
+  // Mobile Google
+  '[data-hveid] div.OhZyZc > a',
+  '[data-hveid] div.fqvXQb > a',
+  // Bing
+  'li[data-id] h2 > a',
+  'li[data-id] div.b_algoheader > a',
+].join(', ');
+
+function setupTrackersPreview(popupUrl) {
+  const elements = [];
+  const links = [];
+
+  for (const el of window.document.querySelectorAll(SELECTORS)) {
+    if (el.dataset.wtm) continue;
+
+    // A link that gives no destination away yet is left unmarked for a later
+    // pass, once it is rewritten to where it leads
+    const destination = getDestination(el);
+    if (!destination) continue;
+
+    el.dataset.wtm = 1;
+    elements.push(el);
+    links.push(destination);
+  }
+
+  if (elements.length) {
+    chrome.runtime.sendMessage({ action: 'getWTMReport', links }, (response) => {
+      if (chrome.runtime.lastError) {
+        console.error('Could not retrieve WTM information on URLs', chrome.runtime.lastError);
+        return;
+      }
+
+      elements.forEach((anchor, i) => {
+        const stats = response.wtmStats[i];
+        if (stats) {
+          try {
+            const wheelEl = getWheelElement(stats, popupUrl);
+            if (!wheelEl) return;
+
+            const container =
+              /* Google */
+              // Desktop
+              anchor.parentElement.querySelector('.B6fmyf') ||
+              anchor.parentElement.parentElement.querySelector('.B6fmyf') ||
+              // Mobile
+              anchor.querySelector('span.yIn8Od') ||
+              anchor.querySelector('div[role="link"]') ||
+              anchor.querySelector('div.UPmit.AP7Wnd') ||
+              /* Bing */
+              anchor.parentElement.parentElement.querySelector('.b_tpcn');
+
+            if (!container) return;
+
+            if (container.classList.contains('b_tpcn')) {
+              container.style.display = 'flex';
+            }
+
+            let tempEl = container.firstElementChild;
+            if (tempEl && tempEl.textContent.includes(stats.domain)) {
+              container.insertBefore(wheelEl, tempEl.nextElementSibling);
+            } else {
+              container.appendChild(wheelEl);
+            }
+          } catch (e) {
+            console.warn('Unexpected error while rendering the Tracker Preview wheel', e);
+          }
+        }
+      });
+    });
+  }
+}
+
+window.addEventListener('message', (message) => {
+  if (!isFromExtensionFrame(message) || typeof message.data !== 'string') {
+    return;
+  }
+
+  if (message.data === 'WTMReportClosePopups') {
+    closePopups();
+  } else if (message.data === 'WTMReportDisable') {
+    closePopups();
+
+    // Remove the wheel from the elements
+    [...document.querySelectorAll('[data-wtm]')].forEach((el) => {
+      delete el.dataset.wtm;
+    });
+
+    [...document.querySelectorAll('.wtm-tracker-wheel-container')].forEach((el) => {
+      el.parentElement.removeChild(el);
+    });
+
+    chrome.runtime.sendMessage({ action: 'disableWTMReport' });
+  } else if (message.data?.startsWith('WTMReportResize')) {
+    const height = message.data.split(':')[1];
+    resizePopup(height);
+  }
+});
+
+function setup() {
+  const popupUrl = chrome.runtime.getURL('pages/trackers-preview/index.html');
+  let timeout = null;
+
+  setupTrackersPreview(popupUrl);
+
+  // New results and links rewritten to their destination both call for another pass
+  new MutationObserver((mutations) => {
+    if (timeout) return;
+    if (!mutations.some((m) => m.addedNodes.length || m.type === 'attributes')) return;
+
+    timeout = setTimeout(() => {
+      timeout = null;
+      setupTrackersPreview(popupUrl);
+    }, 500);
+  }).observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['href'],
+  });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', setup);
+} else {
+  setup();
+}

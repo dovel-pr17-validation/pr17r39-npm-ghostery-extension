@@ -1,0 +1,174 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { store } from 'hybrids';
+
+import Config from '/store/config.js';
+import Options from '/store/options.js';
+
+import * as OptionsObserver from '/utils/options-observer.js';
+import getBrowserInfo from '/utils/browser-info.js';
+import { hasWTMStats } from '/utils/wtm-stats';
+import { isUserScriptsSupported } from '/utils/user-scripts.js';
+import { setup as adblockerSetup, updateEngines } from './adblocker/engines.js';
+import { updateCustomFilters } from './custom-filters/index.js';
+import { openElementPicker } from './element-picker.js';
+import { captureAttribution } from './telemetry/index.js';
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  switch (msg.action) {
+    case 'hasWTMStats':
+      sendResponse(hasWTMStats(msg.domain));
+      break;
+
+    case 'openTabWithUrl':
+      chrome.tabs.create({ url: msg.url }).then(
+        ({ id }) => {
+          sendResponse({ id });
+        },
+        () => sendResponse({ id: null }),
+      );
+      return true;
+
+    case 'openPrivateWindowWithUrl':
+      chrome.windows.getAll().then((windows) => {
+        const inIncognito = windows.find((w) => w.incognito);
+
+        if (inIncognito) {
+          chrome.tabs.create({
+            url: msg.url,
+            windowId: inIncognito.id,
+            active: true,
+          });
+        } else {
+          chrome.windows.create({ url: msg.url, incognito: true });
+        }
+      });
+      break;
+
+    case 'openElementPicker':
+      openElementPicker(msg.tabId).catch(console.error);
+      break;
+
+    case 'updateEngines':
+      updateEngines({ cache: false }).then(() => {
+        sendResponse();
+        console.debug('[helpers] "updateEngines" finished');
+      });
+      return true;
+
+    case 'idle':
+      OptionsObserver.waitForIdle().then(() => {
+        sendResponse();
+        console.debug('[helpers] "idleOptionsObservers" finished');
+      });
+      return true;
+
+    case 'keepAlive':
+      console.debug('[helpers] Received "keepAlive" message');
+      break;
+
+    case 'devtools:navigator':
+      sendResponse({
+        userAgent: navigator.userAgent,
+        platform: navigator.platform,
+        maxTouchPoints: navigator.maxTouchPoints,
+        os: getBrowserInfo().os,
+        token: getBrowserInfo().token,
+      });
+      break;
+
+    // Messages for e2e tests
+
+    case 'e2e:idle':
+      // Extension pages announce saved options after the storage is updated, so the
+      // message can come after this one - read them again to not miss the change
+      store.clear(Options, false);
+
+      Promise.all([OptionsObserver.waitForIdle(), adblockerSetup.pending]).then(() => {
+        sendResponse('done');
+        console.debug('[helpers] "idleOptionsObservers" finished');
+      }, sendResponse);
+      return true;
+
+    case 'e2e:setConfigDomains':
+      store.resolve(Config).then(async (config) => {
+        const domains = {};
+
+        for (const domain of Object.keys(config.domains)) {
+          domains[domain] = null;
+        }
+
+        Object.assign(domains, msg.domains);
+
+        await store.set(Config, { domains });
+
+        sendResponse('done');
+        console.debug('[helpers] "setConfigDomains" finished');
+      }, sendResponse);
+      return true;
+
+    case 'e2e:clearExceptions':
+      store.resolve(Options).then(async (options) => {
+        const exceptions = {};
+
+        for (const id of Object.keys(options.exceptions)) {
+          exceptions[id] = null;
+        }
+
+        await store.set(Options, { exceptions });
+
+        sendResponse('done');
+        console.debug('[helpers] "clearExceptions" finished');
+      }, sendResponse);
+      return true;
+
+    case 'e2e:clearCustomFilters':
+      updateCustomFilters('')
+        .then(() => store.set(Options, { customFilters: { enabled: false } }))
+        .then(() => {
+          sendResponse('done');
+          console.debug('[helpers] "clearCustomFilters" finished');
+        }, sendResponse);
+      return true;
+
+    case 'e2e:managedConfig':
+      chrome.storage.local.set({ managedConfig: msg.config }).then(() => {
+        sendResponse('done');
+        console.debug('[helpers] "managedConfig" finished');
+      }, sendResponse);
+      return true;
+
+    case 'e2e:userScriptsActive':
+      sendResponse(__CHROMIUM__ && isUserScriptsSupported());
+      break;
+
+    case 'e2e:userScriptsRegistrations':
+      if (__CHROMIUM__ && isUserScriptsSupported()) {
+        chrome.userScripts.getScripts().then((scripts) => {
+          sendResponse(scripts.map((script) => script.id));
+        }, sendResponse);
+        return true;
+      }
+
+      sendResponse([]);
+      break;
+
+    case 'e2e:captureAttribution':
+      captureAttribution().then(() => {
+        sendResponse('done');
+        console.debug('[helpers] "captureAttribution" finished');
+      }, sendResponse);
+      return true;
+  }
+
+  return false;
+});

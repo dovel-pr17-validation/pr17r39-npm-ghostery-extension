@@ -1,0 +1,273 @@
+/**
+ * Ghostery Browser Extension
+ * https://www.ghostery.com/
+ *
+ * Copyright 2017-present Ghostery GmbH. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0
+ */
+
+import { html, msg, store, router } from 'hybrids';
+import { ACTION_PAUSE_ASSISTANT } from '@ghostery/config';
+
+import Config from '/store/config.js';
+import Options, { MODE_DEFAULT, MODE_ZAP, GLOBAL_PAUSE_ID } from '/store/options.js';
+import ElementPickerSelectors from '/store/element-picker-selectors.js';
+
+import { numberFormatter } from '/ui/labels.js';
+
+import NoWebsitesSVG from '../assets/no_websites.svg';
+
+import WebsiteDetails from './website-details.js';
+import WebsiteRemove, { SCOPE_FULL } from './website-remove.js';
+import WebsitesAdd from './websites-add.js';
+import Whotracksme from './whotracksme.js';
+
+function removeCallback(domain) {
+  return (host, event) => {
+    // The trash button is nested in the link to the website details
+    event.preventDefault();
+    event.stopPropagation();
+
+    router.navigate(WebsiteRemove, { domain, scope: SCOPE_FULL });
+  };
+}
+
+export default {
+  [router.connect]: { stack: [WebsiteDetails, WebsitesAdd, WebsiteRemove] },
+  config: store(Config),
+  options: store(Options),
+  elementPickerSelectors: store(ElementPickerSelectors),
+  query: '',
+  websites: ({ config, options, elementPickerSelectors, query }) => {
+    if (!store.ready(config, options, elementPickerSelectors)) return [];
+
+    query = query.toLowerCase().trim();
+
+    let websites;
+    if (options.mode === MODE_DEFAULT) {
+      websites = Object.entries(options.paused)
+        .filter(({ id }) => id !== GLOBAL_PAUSE_ID)
+        .filter(
+          ([id, { assist }]) =>
+            // Only show assisted domains if the action is enabled
+            !assist || (assist && config.hasAction(id, ACTION_PAUSE_ASSISTANT)),
+        )
+        .map(([id, { revokeAt, assist, managed }]) => ({
+          id,
+          revokeAt,
+          assist,
+          managed,
+          exceptions: new Set(),
+          counter: 0,
+        }));
+    } else if (options.mode === MODE_ZAP) {
+      websites = Object.keys(options.zapped).map((id) => ({
+        id,
+        exceptions: new Set(),
+        counter: 0,
+      }));
+    }
+
+    // Add custom content blocks
+    Object.entries(elementPickerSelectors.hostnames).forEach(([domain, list]) => {
+      const website = websites.find((e) => e.id === domain);
+      if (website) {
+        website.counter += list.length;
+      } else if (options.mode === MODE_DEFAULT) {
+        websites.push({
+          id: domain,
+          exceptions: new Set(),
+          counter: list.length,
+        });
+      }
+    });
+
+    Object.entries(options.exceptions).forEach(([id, { domains }]) => {
+      domains.forEach((domain) => {
+        const website = websites.find((e) => e.id === domain);
+        if (website) {
+          website.exceptions.add(id);
+          website.counter += 1;
+        } else if (options.mode === MODE_DEFAULT) {
+          websites.push({
+            id: domain,
+            exceptions: new Set([id]),
+            counter: 1,
+          });
+        }
+      });
+    });
+
+    return websites
+      .filter(({ id }) => id.includes(query))
+      .sort((a, b) => {
+        // Sort by assist flag first (without flag first)
+        if (a.assist !== b.assist) return Number(a.assist) - Number(b.assist);
+
+        // Then sort alphabetically by id
+        if (a.id < b.id) return -1;
+        if (a.id > b.id) return 1;
+        return 0;
+      });
+  },
+  assistWebsites: ({ websites }) =>
+    websites.filter(({ assist, managed, counter }) => assist && !managed && counter === 0),
+  userWebsites: ({ websites, assistWebsites }) =>
+    websites.filter((item) => !assistWebsites.includes(item)),
+  render: ({ websites, assistWebsites, userWebsites, query }) => html`
+    <template layout="contents">
+      <settings-page-layout layout="gap:4">
+        <div layout="column gap" layout@992px="margin:bottom">
+          <div layout="row items:center content:space-between">
+            <ui-text type="headline-m">Websites</ui-text>
+          </div>
+          <ui-text type="body-l" mobile-type="body-m" color="secondary">
+            All websites with adjusted protection status will be listed here.
+          </ui-text>
+        </div>
+        <section layout="column gap:4" layout@768px="gap:5">
+          <div layout="row items:center gap:2">
+            <ui-input icon="search" layout="grow:1">
+              <input
+                type="search"
+                value="${query}"
+                placeholder="${msg`Search website...`}"
+                oninput="${html.set('query')}"
+              />
+            </ui-input>
+            <ui-button>
+              <a href="${router.url(WebsitesAdd)}">Add</a>
+            </ui-button>
+          </div>
+          <div layout="column gap">
+            ${
+              !websites.length &&
+              !query &&
+              html`
+                <div layout="block:center width:::400px margin:2:auto" layout@768px="margin:top:4">
+                  <img src="${NoWebsitesSVG}" layout="size:96px" layout@768px="size:128px" />
+                </div>
+              `
+            }
+            ${
+              userWebsites.length > 0 &&
+              html`
+                <settings-option>
+                  Manually Adjusted
+                  <settings-table responsive slot="card-footer">
+                    <div slot="header" layout="column" layout@768px="grid:3fr|4fr|1fr|50px gap:2">
+                      <ui-text type="label-m">Website <span>(${websites.length})</span></ui-text>
+                      <ui-text type="label-m" layout="hidden" layout@768px="block">
+                        Protection status
+                      </ui-text>
+                      <ui-text type="label-m" layout="hidden" layout@768px="block"
+                        >Exceptions</ui-text
+                      >
+                    </div>
+                    ${userWebsites.map(
+                      (item) => html`
+                        <ui-action layout="block" data-qa="component:website:${item.id}">
+                          <a
+                            href="${router.url(WebsiteDetails, {
+                              domain: item.id,
+                            })}"
+                            layout="grid:1|min:auto gap:2 items:center:stretch margin:-2:0 padding:2:0"
+                            layout@768px="grid:3fr|4fr|1fr|50px gap:2"
+                          >
+                            <ui-text type="label-l" ellipsis> ${item.id} </ui-text>
+                            ${
+                              !item.managed &&
+                              html`
+                                <ui-action>
+                                  <button
+                                    onclick="${removeCallback(item.id)}"
+                                    layout="padding:1.5 margin:-1.5"
+                                    layout@768px="order:1 row center"
+                                    data-qa="button:website:trash:${item.id}"
+                                  >
+                                    <ui-icon
+                                      name="trash"
+                                      layout="size:3"
+                                      color="tertiary"
+                                    ></ui-icon>
+                                  </button>
+                                </ui-action>
+                              `
+                            }
+                            <ui-line layout="area:2" layout@768px="hidden"></ui-line>
+                            <settings-protection-status
+                              layout@768px="grow"
+                              revokeAt="${item.revokeAt}"
+                              assist="${item.assist}"
+                            ></settings-protection-status>
+                            <div
+                              layout="row items:center gap self:center"
+                              layout@768px="grow self:auto"
+                            >
+                              <ui-text type="label-m">
+                                ${item.counter ? numberFormatter.format(item.counter) : ''}
+                              </ui-text>
+                            </div>
+                          </a>
+                        </ui-action>
+                      `,
+                    )}
+                  </settings-table>
+                </settings-option>
+              `
+            }
+            ${
+              assistWebsites.length > 0 &&
+              html`
+                <settings-option>
+                  Automatically Adjusted
+                  <span slot="description">
+                    Paused automatically by Ghostery’s Browsing Assistant to prevent ad blocker
+                    breakage.
+                  </span>
+                  <ui-text slot="footer" color="tertiary" underline>
+                    ${msg.html`You can disable it in <a href="${router.url(Whotracksme)}">WhoTracks.Me settings</a>.`}
+                  </ui-text>
+
+                  <settings-table responsive slot="card-footer">
+                    <div slot="header" layout="column" layout@768px="grid:3fr|60px gap:4">
+                      <ui-text type="label-m">Website <span>(${websites.length})</span></ui-text>
+                    </div>
+                    ${assistWebsites.map(
+                      (item) => html`
+                        <ui-action layout="block" data-qa="component:website:${item.id}">
+                          <a
+                            href="${router.url(WebsiteDetails, {
+                              domain: item.id,
+                            })}"
+                            layout="grid:1|min:auto gap:2 items:center:stretch margin:-2:0 padding:2:0"
+                            layout@768px="grid:3fr|60px gap:4"
+                          >
+                            <ui-text type="label-l" ellipsis>${item.id}</ui-text>
+                            <ui-action>
+                              <button
+                                onclick="${removeCallback(item.id)}"
+                                layout="padding:1.5 margin:-1.5"
+                                layout@768px="order:1 row center"
+                                data-qa="button:website:trash:${item.id}"
+                              >
+                                <ui-icon name="trash" layout="size:3" color="tertiary"></ui-icon>
+                              </button>
+                            </ui-action>
+                          </a>
+                        </ui-action>
+                      `,
+                    )}
+                  </settings-table>
+                </settings-option>
+              `
+            }
+          </div>
+        </section>
+      </settings-page-layout>
+    </template>
+  `,
+};
