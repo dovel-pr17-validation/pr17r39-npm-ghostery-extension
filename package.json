@@ -50,7 +50,7 @@
     "@ghostery/adblocker-webextension": "^2.20.3",
     "@ghostery/config": "^0.0.19",
     "@ghostery/scriptlets": "github:ghostery/scriptlets",
-    "@ghostery/urlfilter2dnr": "^2.1.0",
+    "@ghostery/urlfilter2dnr": "^2.1.1",
     "@github/relative-time-element": "^5.3.1",
     "@sentry/browser": "^11.10.0",
     "@whotracksme/reporting": "^12.1.7",
